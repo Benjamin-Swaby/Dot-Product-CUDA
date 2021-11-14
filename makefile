@@ -22,6 +22,12 @@ clean:
 	rm gmon.out
 	rm main
 
+mem_check: link
+	cuda-memcheck ./main
+
+profile: link
+	nsys profile --stats=true --trace=cuda --sample=cpu ./main
+
 $(build_DIR)/%.o: $(src_DIR)/%.cu
 	nvcc -c $< -o $@ -O2 -arch=compute_61
 

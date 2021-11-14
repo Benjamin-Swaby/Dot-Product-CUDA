@@ -3,12 +3,23 @@
 
 
 #define multi 20
-#define N 20
+#define elements 2048*2048
 
 #include <stdio.h>
 #include <iostream>
 
 //DEVICE FUNCTION product
+
+void checkCUDAError(const char *msg)
+{
+    cudaError_t err = cudaGetLastError();
+    if( cudaSuccess != err)
+    {
+        fprintf(stderr, "CUDA Error: %s: %s.\n", msg, cudaGetErrorString(err) );
+        exit(EXIT_FAILURE); 
+    }
+}
+
 
 //args:
 //	float *a -> array in 1
@@ -20,7 +31,7 @@ __global__ void product(float *a, float *b, float *c)
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
    	int stride = blockDim.x * gridDim.x;
 
-   	for(int i = index; i < N; i += stride)
+   	for(int i = index; i < elements; i += stride)
    	{
     	c[i] = a[i] * b[i];
    	}
@@ -29,8 +40,8 @@ __global__ void product(float *a, float *b, float *c)
 
 
 
-Template<unsigned int block_size>
-__device__ void warpReduce(volatile float *sdata, unsigned int tid)
+template<unsigned int block_size, typename T>
+__device__ void warpReduce(volatile T *sdata, unsigned int tid)
 {
 	if(block_size >= 64) sdata[tid] += sdata[tid+32];
 	if(block_size >= 32) sdata[tid] += sdata[tid+16];
@@ -41,55 +52,62 @@ __device__ void warpReduce(volatile float *sdata, unsigned int tid)
 }
 
 
-Template<unsigned int block_size>
-__global__ void reduce(float *in_data, float *out_data, unsigned int n) 
+template<unsigned int blockSize, typename T>
+__global__ void reduceCUDA(T *in_data, T *out_data, size_t N) 
 {
-	extern __shared__ float sdata[];
-	
-	unsigned int tid = threadIdx.x;
-	unsigned int i = blockIdx.x * block_size * 2 + tid;
-	unsigned int grid_size = block_size*2*gridDim.x;
-	
-	sdata[tid] = 0; //init the shared memory with a value
+	__shared__ T sdata[blockSize];
 
-	while(i < n){
-		sdata[tid] += in_data[i] + in_data[i+block_size];
-		i += grid_size;
-	}
+		size_t tid = threadIdx.x;
+		size_t i = blockIdx.x*(blockSize) + tid;
+		size_t gridSize = blockSize*gridDim.x;
+		sdata[tid] = 0;
 
-	__syncthreads();
-
-	if(block_size >= 512)
-	{
-		if(tid < 256){
-			sdata[tid] += sdata[tid + 256];
-		}
-
+		while (i < N) { sdata[tid] += in_data[i]; i += gridSize; }
 		__syncthreads();
-	}
-	
-	if(block_size >= 256)
-	{
-		if(tid < 128){
-			sdata[tid] += sdata[tid + 128];
-		}
 
-		__syncthreads();
-	}
-	
-	if(block_size >= 128)
-	{
-		if(tid < 64){
-			sdata[tid] += sdata[tid + 64];
-		}
+		if (blockSize >= 1024) { if (tid < 512) { sdata[tid] += sdata[tid + 512]; } __syncthreads(); }
+		if (blockSize >=  512) { if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads(); }
+		if (blockSize >=  256) { if (tid < 128) { sdata[tid] += sdata[tid + 128]; } __syncthreads(); }
+		if (blockSize >=  128) { if (tid <  64) { sdata[tid] += sdata[tid +  64]; } __syncthreads(); }
 
-		__syncthreads();
-	}
-
-
-	if(tid < 32) warpReduce(sdata, tid, block_size);
-	if(tid == 0) out_data[blockIdx.x] = sdata[0];
+		if (tid < 32) warpReduce<blockSize>(sdata, tid);
+		if (tid == 0) out_data[blockIdx.x] = sdata[0];
+		
+		
 }
+
+
+template<size_t blockSize, typename T>
+T GPUReduction(T* dA, size_t N)
+{
+    T tot = 0.;
+    size_t n = N;
+    size_t blocksPerGrid = std::ceil((1.*n) / blockSize);
+
+    T* tmp;
+    cudaMalloc(&tmp, sizeof(T) * blocksPerGrid); checkCUDAError("Error allocating tmp [GPUReduction]");
+
+    T* from = dA;
+
+    do
+    {
+        blocksPerGrid   = std::ceil((1.*n) / blockSize);
+        reduceCUDA<blockSize><<<blocksPerGrid, blockSize>>>(from, tmp, n);
+        from = tmp;
+        n = blocksPerGrid;
+    } while (n > blockSize);
+
+    if (n > 1)
+        reduceCUDA<blockSize><<<1, blockSize>>>(tmp, tmp, n);
+
+    cudaDeviceSynchronize();
+    checkCUDAError("Error launching kernel [GPUReduction]");
+
+    cudaMemcpy(&tot, tmp, sizeof(T), cudaMemcpyDeviceToHost); checkCUDAError("Error copying result [GPUReduction]");
+    cudaFree(tmp);
+    return tot;
+}
+
 
 //DEVICE FUNCTION fill:
 
@@ -102,7 +120,7 @@ __global__ void fill(float *a , float x)
    int index =  blockIdx.x * blockDim.x + threadIdx.x;
    int stride = blockDim.x * gridDim.x;
    
-   for(int i = index; i < N; i += stride)
+   for(int i = index; i < elements; i += stride)
    {
        a[i] = x;
    }
@@ -124,7 +142,8 @@ cudaDeviceProp getDetails(int deviceId)
     return props;
 }
 
-int main(void)
+
+void run(float ax , float bx)
 {
 	// define the 2 arrays and a tempory array for the products
 	float *a, *b, *c;	
@@ -134,7 +153,7 @@ int main(void)
     cudaGetDevice(&deviceId);
     cudaDeviceProp props = getDetails(deviceId);	
 
-	int size = N * sizeof(float); //calculate the size of the arrays
+	int size = elements * sizeof(float); //calculate the size of the arrays
 		
 	// create device copies of the arrays
     cudaMallocManaged(&a, size);
@@ -147,8 +166,9 @@ int main(void)
 	cudaMemPrefetchAsync(c, size, deviceId);
 
 	// get the number of sms and then calculate the optimum number of blocks
-	int threads_per_block = 512;
-    printf("number of sms :%d \n", props.multiProcessorCount);
+	#define threads_per_block 512
+
+    //printf("number of sms :%d \n", props.multiProcessorCount);
     int number_of_blocks = props.multiProcessorCount * multi;
 	
 	// create 2 streans
@@ -158,8 +178,8 @@ int main(void)
  	cudaError_t asyncErr;
 
 	// execute 2 kernels on 2 different streams to fill the arrays
-	fill<<<threads_per_block,number_of_blocks,0,stream_a>>>(a,2.0);
-	fill<<<threads_per_block,number_of_blocks,0,stream_b>>>(b,4.0);
+	fill<<<threads_per_block,number_of_blocks,0,stream_a>>>(a,ax);
+	fill<<<threads_per_block,number_of_blocks,0,stream_b>>>(b,bx);
 	
 	// execute a kernel to fill C with the product of a[i] * b[i]
 	// the sum of c is the answer to the dot product
@@ -175,15 +195,18 @@ int main(void)
 	cudaMemPrefetchAsync(result, size, deviceId);
 
 	//C is now an array containing the product of [A] * [B] it must now be split to be added. 
-	reduce<<<5, number_of_blocks>>>(c,result,N);	
-	
-	cudaMemPrefetchAsync(result, size, cudaCpuDeviceId);
+	float my_result = GPUReduction<512,float>(c,elements);
+	std::cout << "result for  "<< ax << " and "<< bx << " == " << my_result << std::endl;
 
-	std::cout << "result = " << result[0] << std::endl;
-
-	// sync and check for errors	
-	asyncErr = cudaDeviceSynchronize();
-    if(asyncErr != cudaSuccess) printf("Error: %s\n", cudaGetErrorString(asyncErr));
 
 }
 
+
+
+int main(void)
+{
+	for(float i = 0.0; i < 0.227; i+=0.0005)
+	{
+		run(i, i+1);
+	}
+}
